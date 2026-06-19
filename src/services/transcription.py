@@ -1,191 +1,211 @@
 """
-ReplyQ AI Agent - Transcription Service (Google AI Studio)
-Open Hands Agent | Tal HaTil Empire
+Voice Transcription Service using Google AI Studio (Gemini API).
+
+This service handles audio-to-text conversion for voice messages
+received from Telegram, utilizing Google's Gemini models for
+high-quality transcription.
 """
-import tempfile
-import os
-import base64
-from typing import Optional
+
+import io
 import httpx
+import asyncio
+from typing import Optional
 from loguru import logger
 
-from config.settings import get_settings
-
-settings = get_settings()
+from src.config import settings
+from src.models import TranscriptionResult
 
 
 class TranscriptionService:
-    """Service for transcribing audio using Google AI Studio."""
-
-    def __init__(self):
-        self.api_key = settings.google_ai_api_key or settings.google_speech_api_key
-        self.model_name = settings.ai_model
-
-    async def transcribe(self, audio_url: str) -> Optional[str]:
-        """Transcribe an audio file from URL."""
+    """
+    Service for transcribing voice messages using Google AI Studio.
+    
+    This service downloads audio files from Telegram, converts them
+    to the appropriate format, and sends them to Google AI Studio's
+    Gemini API for transcription.
+    """
+    
+    def __init__(self, api_key: Optional[str] = None):
+        """
+        Initialize the transcription service.
+        
+        Args:
+            api_key: Google AI API key. If not provided, uses settings.
+        """
+        self.api_key = api_key or settings.GOOGLE_AI_API_KEY
+        self.model = settings.GOOGLE_AI_MODEL
+        self.base_url = "https://generativelanguage.googleapis.com/v1beta"
+        
+    async def transcribe_audio(
+        self,
+        audio_data: bytes,
+        filename: str = "voice.ogg",
+        language: Optional[str] = None
+    ) -> TranscriptionResult:
+        """
+        Transcribe audio data to text.
+        
+        Args:
+            audio_data: Raw audio bytes (OGG format from Telegram)
+            filename: Original filename for content type detection
+            language: Optional language hint (e.g., "he" for Hebrew)
+            
+        Returns:
+            TranscriptionResult with transcribed text and metadata
+            
+        Raises:
+            TranscriptionError: If transcription fails
+        """
+        if not self.api_key:
+            raise TranscriptionError("Google AI API key not configured")
+            
+        logger.info(f"Starting transcription for {filename}, size: {len(audio_data)} bytes")
+        
         try:
-            # Download audio file
-            audio_data = await self._download_audio(audio_url)
-            if not audio_data:
-                return None
+            # For Gemini API, we need to use the vision/multimodal endpoint
+            # with audio support. As of now, Gemini supports audio input.
+            result = await self._transcribe_with_gemini(audio_data, language)
+            logger.info(f"Transcription completed: {len(result.text)} characters")
+            return result
             
-            # Save to temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as f:
-                f.write(audio_data)
-                temp_path = f.name
+        except Exception as e:
+            logger.error(f"Transcription failed: {e}")
+            raise TranscriptionError(f"Failed to transcribe audio: {e}")
+    
+    async def _transcribe_with_gemini(
+        self,
+        audio_data: bytes,
+        language: Optional[str] = None
+    ) -> TranscriptionResult:
+        """
+        Internal method to call Gemini API for transcription.
+        
+        Gemini models can process audio files directly. We convert the
+        audio to base64 and send it to the API.
+        """
+        import base64
+        
+        # Convert audio to base64
+        audio_b64 = base64.b64encode(audio_data).decode("utf-8")
+        
+        # Build prompt for transcription
+        prompt_parts = [
+            {"text": self._build_transcription_prompt(language)},
+        ]
+        
+        # Gemini expects inline data with mime type
+        inline_data = {
+            "mime_type": "audio/ogg",  # Telegram voice messages are OGG
+            "data": audio_b64
+        }
+        
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt_parts[0]["text"]},
+                    {"inline_data": inline_data}
+                ]
+            }],
+            "generationConfig": {
+                "temperature": 0.1,  # Low temperature for factual transcription
+                "maxOutputTokens": 2048,
+            }
+        }
+        
+        url = f"{self.base_url}/models/{self.model}:generateContent?key={self.api_key}"
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(url, json=payload)
             
-            try:
-                # Transcribe using Google AI
-                transcript = await self.transcribe_with_google(temp_path)
-                return transcript
-            finally:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
+            if response.status_code != 200:
+                error_msg = response.text
+                logger.error(f"Gemini API error: {response.status_code} - {error_msg}")
+                raise TranscriptionError(f"Gemini API returned {response.status_code}")
+            
+            result = response.json()
+            
+            # Extract transcription from response
+            if "candidates" in result and len(result["candidates"]) > 0:
+                candidate = result["candidates"][0]
+                if "content" in candidate and "parts" in candidate["content"]:
+                    parts = candidate["content"]["parts"]
+                    transcribed_text = ""
+                    for part in parts:
+                        if "text" in part:
+                            transcribed_text += part["text"]
                     
-        except Exception as e:
-            logger.error(f"Error transcribing audio: {e}")
-            return None
-
-    async def _download_audio(self, url: str) -> Optional[bytes]:
-        """Download audio file from URL."""
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=30.0)
-                if response.status_code == 200:
-                    return response.content
-                logger.warning(f"Failed to download audio: HTTP {response.status_code}")
-                return None
-        except Exception as e:
-            logger.error(f"Error downloading audio: {e}")
-            return None
-
-    async def transcribe_with_google(self, audio_path: str, language: str = "he-IL") -> Optional[str]:
+                    return TranscriptionResult(
+                        text=transcribed_text.strip(),
+                        confidence=0.95,  # Gemini doesn't provide confidence, estimate
+                        language=language or "auto",
+                        model_used=self.model
+                    )
+            
+            raise TranscriptionError("No transcription in Gemini response")
+    
+    def _build_transcription_prompt(self, language: Optional[str] = None) -> str:
         """
-        Transcribe audio using Google Cloud Speech-to-Text API.
+        Build a prompt for the transcription task.
         
         Args:
-            audio_path: Path to the audio file
-            language: Language code (default: Hebrew - he-IL)
+            language: Optional language code (ISO 639-1)
             
         Returns:
-            Transcribed text or None if transcription fails
+            Formatted prompt string
         """
-        if not self.api_key:
-            logger.warning("Google AI API key not configured, using fallback")
-            return await self._fallback_transcribe(audio_path)
+        if language == "he":
+            return """אתה מתמלל מקצועי. תמלל את ההודעה הקולית בדיוק מקסימלי.
+החזר רק את הטקסט המתומלל ללא הערות או הסברים נוספים.
+אם אינך יכול לשמוע בבירור, החזר [לא ברור]."""
         
-        try:
-            # Read and encode audio file
-            with open(audio_path, "rb") as audio_file:
-                audio_content = base64.b64encode(audio_file.read()).decode("utf-8")
-            
-            # Determine audio encoding based on file extension
-            if audio_path.endswith(".ogg"):
-                encoding = "OGG_OPUS"
-            elif audio_path.endswith(".mp3"):
-                encoding = "MP3"
-            elif audio_path.endswith(".wav"):
-                encoding = "LINEAR16"
-            else:
-                encoding = "OGG_OPUS"
-            
-            # Call Google Cloud Speech-to-Text API
-            url = "https://speech.googleapis.com/v1/speech:recognize"
-            params = {"key": self.api_key}
-            
-            payload = {
-                "config": {
-                    "encoding": encoding,
-                    "languageCode": language,
-                    "enableAutomaticPunctuation": True,
-                    "model": "default",
-                    "audioChannelCount": 1
-                },
-                "audio": {
-                    "content": audio_content
-                }
-            }
-            
-            async with httpx.AsyncClient() as client:
-                response = await client.post(url, params=params, json=payload, timeout=30.0)
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    if "results" in result and len(result["results"]) > 0:
-                        transcription = result["results"][0].get("alternatives", [{}])[0].get("transcript", "")
-                        return transcription.strip()
-                else:
-                    logger.error(f"Google Speech API error: {response.text}")
-            
-            return await self._fallback_transcribe(audio_path)
-            
-        except Exception as e:
-            logger.error(f"Error with Google Speech API: {e}")
-            return await self._fallback_transcribe(audio_path)
-
-    async def _fallback_transcribe(self, audio_path: str) -> Optional[str]:
-        """Fallback transcription using basic audio processing."""
-        # This is a placeholder for when API is not available
-        # In production, you could use a local model or return None
-        logger.warning("Using fallback transcription - API not configured")
-        return "[הודעה קולית - יש לבדוק תמלול ידני]"
-
-    async def detect_language(self, audio_path: str) -> str:
-        """Detect the language of an audio file."""
-        # Simple implementation - can be extended with Google Cloud API
-        return "he-IL"  # Default to Hebrew
-
-    async def process_voice_message(self, audio_data: bytes, format: str = "ogg") -> Optional[str]:
+        return f"""You are a professional transcription service. Transcribe the audio message exactly.
+Return ONLY the transcribed text without any additional comments.
+The audio is in language: {language or 'auto-detect'}.
+If you cannot hear clearly, return [unclear]."""
+    
+    async def transcribe_from_url(
+        self,
+        file_url: str,
+        language: Optional[str] = None
+    ) -> TranscriptionResult:
         """
-        Process voice message from Telegram directly.
+        Download audio from URL and transcribe.
         
         Args:
-            audio_data: Raw audio bytes
-            format: Audio format (ogg, mp3, etc.)
+            file_url: Direct URL to audio file
+            language: Optional language hint
             
         Returns:
-            Transcribed text
+            TranscriptionResult
         """
-        if not self.api_key:
-            return "[הודעה קולית]"
+        logger.info(f"Downloading audio from {file_url}")
         
-        try:
-            # Encode audio
-            audio_content = base64.b64encode(audio_data).decode("utf-8")
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(file_url)
+            response.raise_for_status()
             
-            # Determine encoding
-            encoding_map = {
-                "ogg": "OGG_OPUS",
-                "mp3": "MP3",
-                "wav": "LINEAR16",
-                "m4a": "MP3"
-            }
-            encoding = encoding_map.get(format.lower(), "OGG_OPUS")
+            content_type = response.headers.get("content-type", "audio/ogg")
+            filename = f"audio.{content_type.split('/')[-1]}"
             
-            url = "https://speech.googleapis.com/v1/speech:recognize"
-            params = {"key": self.api_key}
-            
-            payload = {
-                "config": {
-                    "encoding": encoding,
-                    "languageCode": "he-IL",
-                    "enableAutomaticPunctuation": True
-                },
-                "audio": {
-                    "content": audio_content
-                }
-            }
-            
-            async with httpx.AsyncClient() as client:
-                response = await client.post(url, params=params, json=payload, timeout=30.0)
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    if "results" in result and len(result["results"]) > 0:
-                        return result["results"][0].get("alternatives", [{}])[0].get("transcript", "")
-            
-            return "[שגיאת תמלול]"
-            
-        except Exception as e:
-            logger.error(f"Error processing voice message: {e}")
-            return "[הודעה קולית - יש לבדוק תמלול ידני]"
+            return await self.transcribe_audio(
+                response.content,
+                filename=filename,
+                language=language
+            )
+
+
+class TranscriptionError(Exception):
+    """Custom exception for transcription errors."""
+    pass
+
+
+# Singleton instance
+_transcription_service: Optional[TranscriptionService] = None
+
+
+def get_transcription_service() -> TranscriptionService:
+    """Get or create the global transcription service instance."""
+    global _transcription_service
+    if _transcription_service is None:
+        _transcription_service = TranscriptionService()
+    return _transcription_service
