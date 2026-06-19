@@ -1,5 +1,6 @@
 """
 ReplyQ AI Agent - Application Settings
+Open Hands Agent | Tal HaTil Empire
 """
 from pydantic_settings import BaseSettings
 from typing import Optional
@@ -11,7 +12,7 @@ class Settings(BaseSettings):
 
     # Application
     app_name: str = "ReplyQ AI Agent"
-    app_version: str = "1.0.0"
+    app_version: str = "2.0.0"
     debug: bool = False
     log_level: str = "INFO"
 
@@ -19,14 +20,14 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
-    # AI Providers
-    openai_api_key: Optional[str] = None
+    # AI Providers - Google AI Studio (Primary)
+    google_ai_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
-    default_ai_provider: str = "openai"
-    ai_model: str = "gpt-4-turbo-preview"
+    default_ai_provider: str = "google"
+    ai_model: str = "gemini-1.5-pro"
 
-    # Whisper (Voice Transcription)
-    whisper_model: str = "base"
+    # Google AI Studio (Voice Transcription)
+    google_speech_api_key: Optional[str] = None
 
     # WhatsApp (Twilio)
     twilio_account_sid: Optional[str] = None
@@ -39,6 +40,11 @@ class Settings(BaseSettings):
     instagram_app_secret: Optional[str] = None
     instagram_webhook_verify_token: str = "replyq_verify_token"
 
+    # Telegram (Primary Channel)
+    telegram_bot_token: Optional[str] = None
+    telegram_webhook_secret: Optional[str] = None
+    telegram_allow_groups: bool = False
+
     # Database
     database_url: str = "sqlite+aiosqlite:///./replyq.db"
     database_echo: bool = False
@@ -47,9 +53,11 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     redis_enabled: bool = False
 
-    # Payment Gateway (Stripe)
-    stripe_api_key: Optional[str] = None
-    stripe_webhook_secret: Optional[str] = None
+    # Payment - PayPal (Primary)
+    paypal_client_id: Optional[str] = None
+    paypal_client_secret: Optional[str] = None
+    paypal_mode: str = "sandbox"  # sandbox or live
+    paypal_webhook_id: Optional[str] = None
 
     # Human Escalation
     human_escalation_webhook_url: Optional[str] = None

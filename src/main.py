@@ -1,5 +1,6 @@
 """
 ReplyQ AI Agent - Main Application Entry Point
+Open Hands Agent | Tal HaTil Empire
 """
 import asyncio
 from contextlib import asynccontextmanager
@@ -11,6 +12,7 @@ import sys
 
 from config.settings import get_settings
 from src.database.connection import init_db, close_db
+from src.channels.telegram import router as telegram_router
 from src.channels.whatsapp import router as whatsapp_router
 from src.channels.instagram import router as instagram_router
 from src.services.payment import get_payment_service
@@ -60,6 +62,7 @@ app.add_middleware(
 )
 
 # Include routers
+app.include_router(telegram_router)
 app.include_router(whatsapp_router)
 app.include_router(instagram_router)
 

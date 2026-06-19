@@ -59,6 +59,8 @@ class Customer(Base):
     id = Column(String, primary_key=True)
     phone = Column(String, unique=True, nullable=True)
     instagram_handle = Column(String, unique=True, nullable=True)
+    telegram_id = Column(String, unique=True, nullable=True)  # Primary channel
+    telegram_username = Column(String, nullable=True)
     segment = Column(SQLEnum(CustomerSegment), default=CustomerSegment.B2C)
     
     # Lead scoring

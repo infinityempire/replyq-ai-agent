@@ -1,12 +1,13 @@
 """
-ReplyQ AI Agent - Payment Service (Stripe Integration)
+ReplyQ AI Agent - Payment Service (PayPal Integration)
+Open Hands Agent | Tal HaTil Empire
 """
 import hashlib
+import base64
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from loguru import logger
-from stripe import StripeClient
-from stripe.models import Price, PaymentLink, PaymentIntent
+import httpx
 
 from config.settings import get_settings
 from src.database.connection import get_db_context
@@ -16,14 +17,51 @@ settings = get_settings()
 
 
 class PaymentService:
-    """Service for handling payment operations with Stripe."""
+    """Service for handling payment operations with PayPal."""
 
     def __init__(self):
-        if settings.stripe_api_key:
-            self.stripe = StripeClient(settings.stripe_api_key)
+        self.paypal_mode = settings.paypal_mode
+        self._access_token = None
+        self._token_expires = None
+        
+        if settings.paypal_client_id and settings.paypal_client_secret:
+            self.paypal_base_url = "https://api-m.sandbox.paypal.com" if self.paypal_mode == "sandbox" else "https://api-m.paypal.com"
         else:
-            self.stripe = None
-            logger.warning("Stripe API key not configured")
+            logger.warning("PayPal credentials not configured")
+            self.paypal_base_url = None
+
+    async def _get_access_token(self) -> Optional[str]:
+        """Get PayPal access token."""
+        if not settings.paypal_client_id or not settings.paypal_client_secret:
+            return None
+        
+        if self._access_token and self._token_expires and datetime.utcnow() < self._token_expires:
+            return self._access_token
+        
+        try:
+            auth = base64.b64encode(
+                f"{settings.paypal_client_id}:{settings.paypal_client_secret}".encode()
+            ).decode()
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.paypal_base_url}/v1/oauth2/token",
+                    headers={"Authorization": f"Basic {auth}"},
+                    data={"grant_type": "client_credentials"},
+                    timeout=30.0
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    self._access_token = data.get("access_token")
+                    expires_in = data.get("expires_in", 3600)
+                    self._token_expires = datetime.utcnow() + timedelta(seconds=expires_in - 60)
+                    return self._access_token
+                    
+        except Exception as e:
+            logger.error(f"Error getting PayPal access token: {e}")
+        
+        return None
 
     async def create_payment_link(
         self,
@@ -33,170 +71,113 @@ class PaymentService:
         description: str,
         expires_in_hours: int = 24
     ) -> Dict[str, Any]:
-        """
-        Create a Stripe payment link for a customer.
-        
-        Args:
-            customer_id: Customer ID in database
-            amount: Amount in smallest currency unit (e.g., cents)
-            currency: Currency code (e.g., 'USD', 'BRL')
-            description: Description of the payment
-            expires_in_hours: Hours until link expires
-            
-        Returns:
-            Dict with payment link details
-        """
-        if not self.stripe:
+        """Create a PayPal payment link for a customer."""
+        if not settings.paypal_client_id:
+            # Fallback to simple PayPal.me link
             return {
-                "success": False,
-                "error": "Stripe not configured"
+                "success": True,
+                "payment_url": f"https://paypal.me/talhatil/{int(amount)}",
+                "fallback": True,
+                "message": "PayPal link generated"
             }
 
         try:
-            # Get customer from database
-            async with get_db_context() as session:
-                from sqlalchemy import select
-                stmt = select(Customer).where(Customer.id == customer_id)
-                result = await session.execute(stmt)
-                customer = result.scalar_one_or_none()
-                
-                if not customer:
-                    return {
-                        "success": False,
-                        "error": "Customer not found"
-                    }
-            
-            # Create Stripe Payment Link
-            # Convert to cents for Stripe
-            amount_cents = int(amount * 100)
-            
-            # Create a price/product inline
-            product = self.stripe.products.create(
-                name=description[:100],  # Stripe product name limit
-                metadata={"customer_id": customer_id}
-            )
-            
-            price = self.stripe.prices.create(
-                product=product.id,
-                unit_amount=amount_cents,
-                currency=currency.lower()
-            )
-            
-            payment_link = self.stripe.payment_links.payment_link_create(
-                line_items=[{"price": price.id, "quantity": 1}],
-                metadata={"customer_id": customer_id},
-                after_completion={"type": "hosted_confirmation", "custom_message": "Obrigado pelo pagamento!"}
-            )
-            
-            # Calculate expiration
-            expires_at = datetime.utcnow() + timedelta(hours=expires_in_hours)
-            
-            # Store in database
-            async with get_db_context() as session:
-                db_payment = PaymentLinkModel(
-                    id=f"pay_{hashlib.md5(payment_link.id.encode()).hexdigest()[:12]}",
-                    customer_id=customer_id,
-                    amount=amount,
-                    currency=currency.upper(),
-                    description=description,
-                    stripe_payment_intent_id=payment_link.id,
-                    payment_link_url=payment_link.url,
-                    status="pending",
-                    expires_at=expires_at
-                )
-                session.add(db_payment)
-                await session.commit()
-            
-            logger.info(f"Payment link created for customer {customer_id}: {payment_link.url}")
-            
-            return {
-                "success": True,
-                "payment_link_id": db_payment.id,
-                "payment_link_url": payment_link.url,
-                "expires_at": expires_at.isoformat(),
-                "message": f"Link de pagamento criado: {payment_link.url}"
-            }
-            
-        except Exception as e:
-            logger.error(f"Error creating payment link: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            access_token = await self._get_access_token()
+            if not access_token:
+                return {"success": False, "error": "Failed to authenticate with PayPal"}
 
-    async def create_payment_intent(
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.paypal_base_url}/v2/checkout/orders",
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "intent": "CAPTURE",
+                        "purchase_units": [{
+                            "amount": {
+                                "currency_code": currency.upper(),
+                                "value": str(amount)
+                            },
+                            "description": description,
+                            "custom_id": customer_id
+                        }]
+                    },
+                    timeout=30.0
+                )
+                
+                if response.status_code in [200, 201]:
+                    data = response.json()
+                    approval_url = next(
+                        (link.get("href") for link in data.get("links", []) 
+                         if link.get("rel") == "approve"),
+                        None
+                    )
+                    
+                    order_id = data.get("id")
+                    expires_at = datetime.utcnow() + timedelta(hours=expires_in_hours)
+                    
+                    async with get_db_context() as session:
+                        db_payment = PaymentLinkModel(
+                            id=f"pay_{hashlib.md5(order_id.encode()).hexdigest()[:12]}",
+                            customer_id=customer_id,
+                            amount=amount,
+                            currency=currency.upper(),
+                            description=description,
+                            stripe_payment_intent_id=order_id,
+                            payment_link_url=approval_url,
+                            status="pending",
+                            expires_at=expires_at
+                        )
+                        session.add(db_payment)
+                        await session.commit()
+                    
+                    logger.info(f"PayPal payment link created: {approval_url}")
+                    
+                    return {
+                        "success": True,
+                        "payment_link_id": db_payment.id,
+                        "payment_url": approval_url,
+                        "order_id": order_id,
+                        "expires_at": expires_at.isoformat()
+                    }
+                else:
+                    logger.error(f"PayPal error: {response.text}")
+                    return {"success": False, "error": response.text}
+                    
+        except Exception as e:
+            logger.error(f"Error creating PayPal payment: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def create_paypal_link(
         self,
         customer_id: str,
         amount: float,
-        currency: str,
-        description: str
+        currency: str = "USD",
+        description: str = "Payment"
     ) -> Dict[str, Any]:
-        """
-        Create a Stripe PaymentIntent for more control.
+        """Create a simple PayPal.me style link."""
+        paypal_link = f"https://paypal.me/talhatil/{int(amount)}"
         
-        Args:
-            customer_id: Customer ID
-            amount: Amount in currency units (not cents)
-            currency: Currency code
-            
-        Returns:
-            Dict with PaymentIntent details
-        """
-        if not self.stripe:
-            return {
-                "success": False,
-                "error": "Stripe not configured"
-            }
-
-        try:
-            # Get customer from database
-            async with get_db_context() as session:
-                from sqlalchemy import select
-                stmt = select(Customer).where(Customer.id == customer_id)
-                result = await session.execute(stmt)
-                customer = result.scalar_one_or_none()
-            
-            # Convert to cents
-            amount_cents = int(amount * 100)
-            
-            # Create PaymentIntent
-            intent = self.stripe.payment_intents.payment_intent_create(
-                amount=amount_cents,
-                currency=currency.lower(),
-                metadata={
-                    "customer_id": customer_id,
-                    "description": description
-                },
-                automatic_payment_methods={"enabled": True}
+        async with get_db_context() as session:
+            db_payment = PaymentLinkModel(
+                id=f"pp_{hashlib.md5(str(datetime.utcnow().timestamp()).encode()).hexdigest()[:12]}",
+                customer_id=customer_id,
+                amount=amount,
+                currency=currency.upper(),
+                description=description,
+                status="pending"
             )
-            
-            # Store in database
-            async with get_db_context() as session:
-                db_payment = PaymentLinkModel(
-                    id=f"pi_{hashlib.md5(intent.id.encode()).hexdigest()[:12]}",
-                    customer_id=customer_id,
-                    amount=amount,
-                    currency=currency.upper(),
-                    description=description,
-                    stripe_payment_intent_id=intent.id,
-                    status="pending"
-                )
-                session.add(db_payment)
-                await session.commit()
-            
-            return {
-                "success": True,
-                "payment_intent_id": intent.id,
-                "client_secret": intent.client_secret,
-                "message": "PaymentIntent criado com sucesso"
-            }
-            
-        except Exception as e:
-            logger.error(f"Error creating PaymentIntent: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            session.add(db_payment)
+            await session.commit()
+        
+        return {
+            "success": True,
+            "payment_id": db_payment.id,
+            "payment_url": paypal_link,
+            "message": "קישור PayPal נוצר בהצלחה"
+        }
 
     async def check_payment_status(self, payment_id: str) -> Dict[str, Any]:
         """Check the status of a payment."""
@@ -220,26 +201,17 @@ class PaymentService:
             }
 
     async def handle_payment_webhook(self, event_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Handle Stripe webhook events.
-        
-        Args:
-            event_data: Stripe webhook event data
-            
-        Returns:
-            Result of webhook processing
-        """
+        """Handle PayPal webhook events."""
         try:
-            event_type = event_data.get("type")
-            data = event_data.get("data", {}).get("object", {})
+            event_type = event_data.get("event_type")
+            resource = event_data.get("resource", {})
             
-            payment_intent_id = data.get("id")
+            order_id = resource.get("id")
             
-            # Find payment in database
             async with get_db_context() as session:
                 from sqlalchemy import select
                 stmt = select(PaymentLinkModel).where(
-                    PaymentLinkModel.stripe_payment_intent_id == payment_intent_id
+                    PaymentLinkModel.stripe_payment_intent_id == order_id
                 )
                 result = await session.execute(stmt)
                 payment = result.scalar_one_or_none()
@@ -247,18 +219,13 @@ class PaymentService:
                 if not payment:
                     return {"success": False, "error": "Payment not found in database"}
                 
-                if event_type == "payment_intent.succeeded":
+                if event_type == "PAYMENT.CAPTURE.COMPLETED":
                     payment.status = "paid"
                     payment.paid_at = datetime.utcnow()
-                    logger.info(f"Payment succeeded: {payment_intent_id}")
-                    
-                elif event_type == "payment_intent.payment_failed":
+                    logger.info(f"Payment completed: {order_id}")
+                elif event_type == "PAYMENT.CAPTURE.DENIED":
                     payment.status = "failed"
-                    logger.warning(f"Payment failed: {payment_intent_id}")
-                    
-                elif event_type == "payment_intent.canceled":
-                    payment.status = "cancelled"
-                    logger.info(f"Payment cancelled: {payment_intent_id}")
+                    logger.warning(f"Payment denied: {order_id}")
                 
                 await session.commit()
                 
@@ -298,38 +265,28 @@ class PaymentService:
 
     async def cancel_payment_link(self, payment_id: str) -> Dict[str, Any]:
         """Cancel a pending payment link."""
-        if not self.stripe:
-            return {"success": False, "error": "Stripe not configured"}
-
-        try:
-            async with get_db_context() as session:
-                from sqlalchemy import select
-                stmt = select(PaymentLinkModel).where(PaymentLinkModel.id == payment_id)
-                result = await session.execute(stmt)
-                payment = result.scalar_one_or_none()
-                
-                if not payment:
-                    return {"success": False, "error": "Payment not found"}
-                
-                if payment.status != "pending":
-                    return {"success": False, "error": f"Cannot cancel payment with status: {payment.status}"}
-                
-                # If it's a payment link, we can't really cancel it, just mark as cancelled
-                payment.status = "cancelled"
-                await session.commit()
-                
-                return {
-                    "success": True,
-                    "payment_id": payment_id,
-                    "message": "Pagamento cancelado"
-                }
-                
-        except Exception as e:
-            logger.error(f"Error cancelling payment: {e}")
-            return {"success": False, "error": str(e)}
+        async with get_db_context() as session:
+            from sqlalchemy import select
+            stmt = select(PaymentLinkModel).where(PaymentLinkModel.id == payment_id)
+            result = await session.execute(stmt)
+            payment = result.scalar_one_or_none()
+            
+            if not payment:
+                return {"success": False, "error": "Payment not found"}
+            
+            if payment.status != "pending":
+                return {"success": False, "error": f"Cannot cancel payment with status: {payment.status}"}
+            
+            payment.status = "cancelled"
+            await session.commit()
+            
+            return {
+                "success": True,
+                "payment_id": payment_id,
+                "message": "התשלום בוטל"
+            }
 
 
-# Singleton instance
 _payment_service: Optional[PaymentService] = None
 
 
